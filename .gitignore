@@ -1,0 +1,12 @@
+# C++ Build
+**/build/
+*.exe
+*.dll
+*.pdb
+*.log
+
+# GGUF models
+*.gguf
+
+# Standard Python
+__pycache__/

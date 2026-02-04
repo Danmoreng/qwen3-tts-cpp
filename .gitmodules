@@ -1,0 +1,9 @@
+[submodule "python_ref"]
+	path = python_ref
+	url = https://github.com/QwenLM/Qwen3-TTS.git
+[submodule "third_party/llama.cpp"]
+	path = third_party/llama.cpp
+	url = https://github.com/ggerganov/llama.cpp.git
+[submodule "third_party/qwen3-asr.cpp"]
+	path = third_party/qwen3-asr.cpp
+	url = git@github.com:predict-woo/qwen3-asr.cpp.git
