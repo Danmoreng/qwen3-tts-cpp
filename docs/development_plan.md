@@ -21,15 +21,21 @@ Develop a high-performance, standalone C++ inference engine for Qwen3-TTS using 
 
 ## Phase 2: Talker (Autoregressive Transformer)
 **Goal:** Convert text inputs into audio codes.
-**Status:** Pending.
+**Status:** In Progress (Architectural Refinement).
 
-*   [ ] **Task 2.1: Implement Main Talker Class**
-    *   **File:** `cpp/qwen3_talker.cpp` (New)
-    *   **Description:** Implement the 1.7B Llama-based transformer.
+*   [ ] **Task 2.1: Implement Qwen3TalkerLLM (Transformer Core)**
+    *   **File:** `cpp/qwen3_talker_llm.cpp` (New)
+    *   **Strategy:** Port the `TextDecoder` architecture from `qwen3-asr.cpp`.
+    *   **Details:**
+        *   Adopt `ggml-backend` and `ggml-scheduler` for hardware-agnostic execution.
+        *   Implement high-performance **KV Cache** management (per-layer 3D tensors).
+        *   Reuse the Llama-style `build_graph` (RMSNorm, SwiGLU MLP).
+*   [ ] **Task 2.2: Implement Multimodal RoPE**
+    *   **Description:** Extend the transformer core to support 3D position IDs.
     *   **Key Challenges:**
-        *   **Multimodal RoPE:** Implement 3D position ID logic (Text, Audio, Width/Height).
-        *   **KV Cache:** Manage state for autoregressive generation.
-*   [ ] **Task 2.2: Implement Code Predictor**
+        *   Implement text and audio coordinate logic.
+        *   Integrate with `ggml_rope_ext`.
+*   [ ] **Task 2.3: Implement Code Predictor**
     *   **Description:** Implement the small "refinement" transformer that predicts codes 1..N from code 0.
     *   **Integration:** This runs *inside* the main generation loop.
 
