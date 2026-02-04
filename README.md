@@ -1,8 +1,6 @@
 # Qwen3-TTS.cpp
 
-<p align="center">
-    <img src="https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/qwen3_tts_logo.png" width="400"/>
-</p>
+> **Note**: This project is an experiment in AI-assisted software development. The core C++ implementation and architecture mapping were developed by an AI agent through iterative loops, exploring how effectively agents can translate complex transformer architectures into optimized GGML-based C++.
 
 A high-performance C++ implementation of the **Qwen3-TTS** model using `llama.cpp` and `ggml`. This project aims to provide standalone, dependency-free inference for state-of-the-art text-to-speech on Windows, Linux, and macOS.
 
