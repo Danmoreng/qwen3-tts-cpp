@@ -24,6 +24,9 @@ struct Qwen3TalkerLLMConfig {
     float rms_norm_eps = 1e-6f;
     float rope_theta = 1000000.0f;
     
+    // MRoPE sections: temporal, height, width
+    std::vector<int32_t> mrope_section = {16, 56, 56}; // Sum must be head_dim (128)
+    
     // TTS specific special tokens (if needed for generation loop)
     int32_t boa_token_id = -1; // Begin of Audio
     int32_t eoa_token_id = -1; // End of Audio
@@ -116,9 +119,10 @@ public:
     
     // Forward pass: compute logits for input tokens
     // tokens: input token IDs [n_tokens]
+    // pos_ids: multimodal position IDs [3, n_tokens] (temporal, height, width)
     // n_past: number of tokens already in KV cache
     // output: logits [n_tokens, vocab_size] (flattened)
-    bool forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,
+    bool forward(const int32_t * tokens, const int32_t * pos_ids, int32_t n_tokens, int32_t n_past,
                  std::vector<float> & output);
                  
     const Qwen3TalkerLLMConfig & get_config() const { return model_.config; }
@@ -126,7 +130,7 @@ public:
     
 private:
     // Build computation graph for forward pass
-    struct ggml_cgraph * build_graph(const int32_t * tokens, int32_t n_tokens, int32_t n_past);
+    struct ggml_cgraph * build_graph(const int32_t * tokens, const int32_t * pos_ids, int32_t n_tokens, int32_t n_past);
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);

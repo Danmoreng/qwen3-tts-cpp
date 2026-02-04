@@ -20,6 +20,15 @@
 ### Activation Functions
 - **SnakeBeta**: Implemented via `ggml` composition (`sin`, `sqr`, `add`, `div`). Requires explicit `ggml_repeat` for broadcasting constants (like epsilon) and the final additive term.
 
+### Talker LLM (Transformer)
+- **Architecture**: Ported the Llama-style decoder from `qwen3-asr.cpp`. Uses `ggml-backend` for unified CPU/CUDA support.
+- **KV Cache**: Implemented using 3D tensors `(head_dim, n_kv_heads, n_ctx)` per layer.
+- **Multimodal RoPE (MRoPE)**:
+    - Splits the `head_dim` into 3 sections (Temporal, Height, Width).
+    - Requires 3D position IDs provided as a `(3, n_tokens)` tensor.
+    - Current implementation uses `ggml_view_3d` to slice query/key states before applying `ggml_rope_ext`.
+    - **Known Issue**: Hitting `GGML_ASSERT` in `ggml_view_3d` boundary checks during autoregressive steps (size 1 tensors). Potential workaround: ensure tensors are contiguous and verify `nb` strides.
+
 ### Convolution Workarounds
 - **F16 Restriction**: The local `ggml_conv_1d` implementation hardcodes `GGML_TYPE_F16` for its internal `im2col` operation. This triggers assertions if the CPU/Backend doesn't support F16 im2col kernels for F32 weights. 
 - **Solution**: Implemented `fixed_ggml_conv_1d` which explicitly uses `GGML_TYPE_F32` for `im2col`.

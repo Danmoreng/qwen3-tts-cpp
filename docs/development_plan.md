@@ -31,10 +31,9 @@ Develop a high-performance, standalone C++ inference engine for Qwen3-TTS using 
         *   Implement high-performance **KV Cache** management (per-layer 3D tensors).
         *   Reuse the Llama-style `build_graph` (RMSNorm, SwiGLU MLP).
 *   [ ] **Task 2.2: Implement Multimodal RoPE**
+    *   **Status:** In Progress.
     *   **Description:** Extend the transformer core to support 3D position IDs.
-    *   **Key Challenges:**
-        *   Implement text and audio coordinate logic.
-        *   Integrate with `ggml_rope_ext`.
+    *   **Current State:** 3D ID generation and slicing logic implemented. Debugging `ggml_view_3d` boundary assertions in autoregressive loop.
 *   [ ] **Task 2.3: Implement Code Predictor**
     *   **Description:** Implement the small "refinement" transformer that predicts codes 1..N from code 0.
     *   **Integration:** This runs *inside* the main generation loop.

@@ -149,9 +149,10 @@ bool Qwen3TalkerLLM::parse_config(struct gguf_context * ctx) {
     cfg.n_heads = get_u32("talker.attention.head_count", 16);
     cfg.n_kv_heads = get_u32("talker.attention.head_count_kv", 8);
     cfg.intermediate_size = get_u32("talker.feed_forward_length", 3072);
+    cfg.head_dim = get_u32("talker.attention.key_length", 128);
     
     // Some configs might not be present in the script yet, use defaults or infer
-    cfg.head_dim = cfg.hidden_size / cfg.n_heads; 
+    // cfg.head_dim = cfg.hidden_size / cfg.n_heads; 
     
     // Note: eps and rope_theta were not explicitly saved in convert script?
     // Using Qwen2 defaults if missing
@@ -317,12 +318,12 @@ bool Qwen3TalkerLLM::init_kv_cache(int32_t n_ctx) {
     for (int il = 0; il < cfg.n_layers; ++il) {
         state_.cache.k_cache[il] = ggml_new_tensor_3d(
             state_.cache.ctx, GGML_TYPE_F16, // Use F16 for KV cache efficiency
-            cfg.head_dim, cfg.n_kv_heads, n_ctx);
+            state_.cache.head_dim, state_.cache.n_kv_heads, n_ctx);
         ggml_format_name(state_.cache.k_cache[il], "k_cache_%d", il);
         
         state_.cache.v_cache[il] = ggml_new_tensor_3d(
             state_.cache.ctx, GGML_TYPE_F16,
-            cfg.head_dim, cfg.n_kv_heads, n_ctx);
+            state_.cache.head_dim, state_.cache.n_kv_heads, n_ctx);
         ggml_format_name(state_.cache.v_cache[il], "v_cache_%d", il);
     }
     
@@ -335,7 +336,8 @@ void Qwen3TalkerLLM::clear_kv_cache() {
     state_.cache.n_used = 0;
 }
 
-struct ggml_cgraph * Qwen3TalkerLLM::build_graph(const int32_t * tokens, int32_t n_tokens, int32_t n_past) {
+struct ggml_cgraph * Qwen3TalkerLLM::build_graph(const int32_t * tokens, const int32_t * pos_ids, int32_t n_tokens, int32_t n_past) {
+    // printf("build_graph: n_tokens=%d, n_past=%d\n", n_tokens, n_past);
     const auto & cfg = model_.config;
     struct ggml_init_params params = {
         /*.mem_size   =*/ state_.compute_meta.size(),
@@ -351,7 +353,7 @@ struct ggml_cgraph * Qwen3TalkerLLM::build_graph(const int32_t * tokens, int32_t
     ggml_set_name(inp_tokens, "inp_tokens");
     ggml_set_input(inp_tokens);
     
-    struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    struct ggml_tensor * inp_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 3, n_tokens);
     ggml_set_name(inp_pos, "inp_pos");
     ggml_set_input(inp_pos);
     
@@ -367,6 +369,8 @@ struct ggml_cgraph * Qwen3TalkerLLM::build_graph(const int32_t * tokens, int32_t
     const int n_kv_head = cfg.n_kv_heads;
     const int head_dim = cfg.head_dim;
     const float rope_theta = cfg.rope_theta;
+    
+    const auto & mrope_section = cfg.mrope_section;
     
     for (int il = 0; il < cfg.n_layers; ++il) {
         // std::cout << "Building layer " << il << std::endl;
@@ -387,15 +391,54 @@ struct ggml_cgraph * Qwen3TalkerLLM::build_graph(const int32_t * tokens, int32_t
         struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
         struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
         
-        // Reshape [N, head_dim * n_head] -> [N, n_head, head_dim] -> [head_dim, n_head, N] (transposed)
-        // ggml_reshape_3d: [ne0, ne1, ne2]
-        Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
-        Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        // printf("Layer %d Q shape: (%lld,%lld,%lld), K shape: (%lld,%lld,%lld)\n", il,
+        //        (long long)Qcur->ne[0], (long long)Qcur->ne[1], (long long)Qcur->ne[2],
+        //        (long long)Kcur->ne[0], (long long)Kcur->ne[1], (long long)Kcur->ne[2]);
+
+        // Reshape [N, head_dim * n_head] -> [head_dim, n_head, N]
+        Qcur = ggml_cont(ctx0, ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens));
+        Kcur = ggml_cont(ctx0, ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens));
+        Vcur = ggml_cont(ctx0, ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens));
         
-        // RoPE
-        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, head_dim, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, head_dim, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        // printf("Qcur strides: %zu, %zu, %zu. nbytes=%zu\n", Qcur->nb[0], Qcur->nb[1], Qcur->nb[2], ggml_nbytes(Qcur));
+        
+        // Multimodal RoPE
+        // Qcur is [head_dim, n_head, n_tokens]
+        // Kcur is [head_dim, n_kv_head, n_tokens]
+        // Split head_dim into sections: mrope_section[0], mrope_section[1], mrope_section[2]
+        // Note: mrope_section sum should be head_dim
+        
+        struct ggml_tensor * Q_parts[3];
+        struct ggml_tensor * K_parts[3];
+        
+        int offset = 0;
+        for (int i = 0; i < 3; ++i) {
+            int sec_dim = mrope_section[i];
+            size_t view_offs = offset * Qcur->nb[0];
+
+            if (view_offs + sec_dim * Qcur->nb[0] > ggml_nbytes(Qcur)) {
+                 fprintf(stderr, "MRoPE BOUNDARY ERROR: Slice %d, offset=%d, sec_dim=%d, Qcur nbytes=%zu, view_end=%zu\n",
+                         i, offset, sec_dim, ggml_nbytes(Qcur), view_offs + sec_dim * Qcur->nb[0]);
+            }
+
+            struct ggml_tensor * Q_sec = ggml_view_3d(ctx0, Qcur, sec_dim, n_head, n_tokens, Qcur->nb[1], Qcur->nb[2], view_offs);
+            struct ggml_tensor * K_sec = ggml_view_3d(ctx0, Kcur, sec_dim, n_kv_head, n_tokens, Kcur->nb[1], Kcur->nb[2], view_offs);
+            
+            // Apply RoPE with corresponding position ID row
+            struct ggml_tensor * pos_sec = ggml_view_1d(ctx0, inp_pos, n_tokens, i * inp_pos->nb[1]);
+            
+            Q_parts[i] = ggml_rope_ext(ctx0, Q_sec, pos_sec, nullptr, sec_dim, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            K_parts[i] = ggml_rope_ext(ctx0, K_sec, pos_sec, nullptr, sec_dim, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            
+            offset += sec_dim;
+        }
+        
+        // Concatenate parts back along dim 0 (head_dim)
+        Qcur = ggml_concat(ctx0, Q_parts[0], Q_parts[1], 0);
+        Qcur = ggml_concat(ctx0, Qcur, Q_parts[2], 0);
+        
+        Kcur = ggml_concat(ctx0, K_parts[0], K_parts[1], 0);
+        Kcur = ggml_concat(ctx0, Kcur, K_parts[2], 0);
         
         // KV Cache Update
         struct ggml_tensor * k_cache = state_.cache.k_cache[il];
@@ -487,13 +530,13 @@ struct ggml_cgraph * Qwen3TalkerLLM::build_graph(const int32_t * tokens, int32_t
     return gf;
 }
 
-bool Qwen3TalkerLLM::forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,
+bool Qwen3TalkerLLM::forward(const int32_t * tokens, const int32_t * pos_ids, int32_t n_tokens, int32_t n_past,
                              std::vector<float> & output) {
     if (!model_.ctx) return false;
     if (state_.cache.n_ctx == 0) init_kv_cache(2048); // Auto-init
     
     // std::cout << "Building graph..." << std::endl;
-    struct ggml_cgraph * gf = build_graph(tokens, n_tokens, n_past);
+    struct ggml_cgraph * gf = build_graph(tokens, pos_ids, n_tokens, n_past);
     
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         std::cerr << "Failed to allocate graph" << std::endl;
@@ -506,9 +549,8 @@ bool Qwen3TalkerLLM::forward(const int32_t * tokens, int32_t n_tokens, int32_t n
     ggml_backend_tensor_set(inp_tokens, tokens, 0, n_tokens * sizeof(int32_t));
     
     struct ggml_tensor * inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
-    std::vector<int32_t> pos(n_tokens);
-    for (int i=0; i<n_tokens; ++i) pos[i] = n_past + i;
-    ggml_backend_tensor_set(inp_pos, pos.data(), 0, n_tokens * sizeof(int32_t));
+    // pos_ids is [3, n_tokens]
+    ggml_backend_tensor_set(inp_pos, pos_ids, 0, 3 * n_tokens * sizeof(int32_t));
     
     // Compute
     // std::cout << "Computing graph..." << std::endl;

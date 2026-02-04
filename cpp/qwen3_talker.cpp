@@ -55,8 +55,20 @@ std::vector<int32_t> Qwen3Talker::generate(const std::string & text, const std::
     std::vector<float> logits;
     
     for (int i = 0; i < max_new_tokens; ++i) {
+        // Construct Multimodal Position IDs [3, current_batch.size()]
+        // For pure text tokens, all 3 dims are usually the same (linear)
+        // For audio frames, it might differ, but for now let's use linear + offset
+        int n_curr = current_batch.size();
+        std::vector<int32_t> pos_ids(3 * n_curr);
+        for (int j = 0; j < n_curr; ++j) {
+            int p = n_past + j;
+            pos_ids[0 * n_curr + j] = p; // Temporal
+            pos_ids[1 * n_curr + j] = p; // Height
+            pos_ids[2 * n_curr + j] = p; // Width
+        }
+
         // Run LLM
-        if (!llm.forward(current_batch.data(), current_batch.size(), n_past, logits)) {
+        if (!llm.forward(current_batch.data(), pos_ids.data(), n_curr, n_past, logits)) {
             std::cerr << "LLM forward failed" << std::endl;
             break;
         }
