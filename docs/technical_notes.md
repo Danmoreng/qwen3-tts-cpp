@@ -18,8 +18,13 @@
 - **Large File Support**: Loading the ~8GB model on Windows requires using `_fseeki64` and `_ftelli64` to bypass 32-bit `long` limits.
 
 ### Activation Functions
-- **SnakeBeta**: Implemented via `ggml` composition (`sin`, `sqr`, `add`, `div`) as a temporary measure until a custom CUDA kernel is optimized.
+- **SnakeBeta**: Implemented via `ggml` composition (`sin`, `sqr`, `add`, `div`). Requires explicit `ggml_repeat` for broadcasting constants (like epsilon) and the final additive term.
+
+### Convolution Workarounds
+- **F16 Restriction**: The local `ggml_conv_1d` implementation hardcodes `GGML_TYPE_F16` for its internal `im2col` operation. This triggers assertions if the CPU/Backend doesn't support F16 im2col kernels for F32 weights. 
+- **Solution**: Implemented `fixed_ggml_conv_1d` which explicitly uses `GGML_TYPE_F32` for `im2col`.
+- **Batch Reshaping**: `ggml_conv_1d` and `ggml_conv_transpose_1d` expect 3D/4D inputs. Tensors must be reshaped from `(T, C)` to `(T, C, 1)` before processing.
 
 ## Runtime Quirks
-- **Shared Libraries**: The project builds `llama.cpp` as shared libraries (`llama.dll`, `ggml.dll`). The build script automatically deploys these to the build root for easier execution.
-- **Python Reference**: Used for weight extraction and verification. Reference scripts should use `device="cpu"` and `dtype=torch.float32` for maximum compatibility in non-CUDA Python environments.
+- **Memory Context**: The decoder graph, especially the 4-stage upsampling chain, consumes significant memory during graph expansion. `ctx_compute` should be at least 2GB for a sequence length of 100 frames.
+- **Transposed Tensors**: Must be made contiguous via `ggml_cont` after `ggml_transpose` to avoid shape assertions in downstream ops.
