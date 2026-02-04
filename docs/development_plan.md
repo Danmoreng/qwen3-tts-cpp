@@ -23,7 +23,7 @@ Develop a high-performance, standalone C++ inference engine for Qwen3-TTS using 
 **Goal:** Convert text inputs into audio codes.
 **Status:** In Progress (Architectural Refinement).
 
-*   [ ] **Task 2.1: Implement Qwen3TalkerLLM (Transformer Core)**
+*   [x] **Task 2.1: Implement Qwen3TalkerLLM (Transformer Core)**
     *   **File:** `cpp/qwen3_talker_llm.cpp` (New)
     *   **Strategy:** Port the `TextDecoder` architecture from `qwen3-asr.cpp`.
     *   **Details:**

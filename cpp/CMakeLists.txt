@@ -28,6 +28,7 @@ add_executable(qwen3-tts-cli
     qwen3_audio_decoder.cpp
     qwen3_talker.cpp
     qwen3_common.cpp
+    qwen3_talker_llm.cpp
 )
 
 # Link against llama (high level) and ggml (low level for custom ops)

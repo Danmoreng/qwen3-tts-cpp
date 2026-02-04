@@ -1,24 +1,24 @@
 #pragma once
 
-#include "ggml.h"
-#include "qwen3_types.h"
+#include "qwen3_talker_llm.h"
 #include <vector>
 #include <string>
-#include <map>
 
-struct Qwen3Talker {
-    Qwen3TalkerConfig config;
-    std::map<std::string, struct ggml_tensor *> weights;
-    struct ggml_context * ctx_w = nullptr;
-
-    Qwen3Talker(const Qwen3TalkerConfig & cfg);
+// High-level Talker class that orchestrates the LLM generation
+class Qwen3Talker {
+public:
+    Qwen3Talker(const Qwen3TalkerConfig & cfg); // Kept for compat with main.cpp for now
     ~Qwen3Talker();
 
     bool load_weights(const std::string & model_path);
 
     // Generate audio codes from text
-    // Returns: vector of codes for each frame. Shape: (n_codebooks, seq_len)
-    // Note: This is simplified. Real output is flattened or shaped differently.
-    // For Qwen3-TTS, we predict codes.
+    // Returns flattened codes
     std::vector<int32_t> generate(const std::string & text, const std::string & ref_audio_path);
+
+private:
+    qwen3::Qwen3TalkerLLM llm;
+    
+    // Helper to tokenize text (placeholder for now)
+    std::vector<int32_t> tokenize(const std::string & text);
 };

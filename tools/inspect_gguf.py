@@ -9,8 +9,8 @@ def inspect(path):
     
     for tensor in reader.tensors:
         name = tensor.name
-        if "dec" in name or "quant" in name:
-            print(f"{name} | Shape: {tensor.data.shape}")
+        # if "dec" in name or "quant" in name:
+        print(f"{name} | Shape: {tensor.data.shape}")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
