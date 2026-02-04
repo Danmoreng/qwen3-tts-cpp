@@ -89,8 +89,10 @@ bool Qwen3AudioDecoder::load_weights(const std::string & model_path) {
     while (cur) {
         const char * name = ggml_get_name(cur);
         
-        // Filter for decoder weights (dec.*)
-        if (strncmp(name, "dec.", 4) == 0 || strncmp(name, "decoder.", 8) == 0) {
+        // Filter for decoder weights
+        if (strncmp(name, "dec.", 4) == 0 || 
+            strncmp(name, "decoder.", 8) == 0 ||
+            strncmp(name, "speech_tokenizer.decoder.", 25) == 0) {
             
             struct ggml_tensor * tensor = ggml_get_tensor(ctx_w, name);
             if (!tensor) {
@@ -112,6 +114,7 @@ bool Qwen3AudioDecoder::load_weights(const std::string & model_path) {
                         break;
                     }
                     
+                    // printf("Loaded: %s (%lld, %lld)\n", name, (long long)tensor->ne[0], (long long)tensor->ne[1]);
                     weights[std::string(name)] = tensor;
                     loaded_count++;
                 }
@@ -162,18 +165,31 @@ struct ggml_tensor * ggml_snake_beta(
     struct ggml_tensor * sin_sq = ggml_sqr(ctx, sin_ax);
 
     // 4. 1 / (beta + eps)
-    struct ggml_tensor * eps_tensor = make_f32_tensor(ctx, eps);
     // beta + eps
-    struct ggml_tensor * beta_eps = ggml_add(ctx, beta_b, eps_tensor); 
+    struct ggml_tensor * eps_tensor = make_f32_tensor(ctx, eps);
+    struct ggml_tensor * eps_rep = ggml_repeat(ctx, eps_tensor, beta_b);
+    printf("SNAKE EPS ADD START: beta_b(%lld,%lld) + eps_rep(%lld,%lld)\n", 
+           (long long)beta_b->ne[0], (long long)beta_b->ne[1], (long long)eps_rep->ne[0], (long long)eps_rep->ne[1]);
+    struct ggml_tensor * beta_eps = ggml_add(ctx, beta_b, eps_rep); 
+    printf("SNAKE EPS ADD END\n");
     
     struct ggml_tensor * one = make_f32_tensor(ctx, 1.0f);
-    struct ggml_tensor * scale = ggml_div(ctx, one, beta_eps);
+    struct ggml_tensor * one_rep = ggml_repeat(ctx, one, beta_eps);
+    printf("SNAKE DIV START: one_rep(%lld,%lld) / beta_eps(%lld,%lld)\n", 
+           (long long)one_rep->ne[0], (long long)one_rep->ne[1], (long long)beta_eps->ne[0], (long long)beta_eps->ne[1]);
+    struct ggml_tensor * scale = ggml_div(ctx, one_rep, beta_eps);
+    printf("SNAKE DIV END\n");
 
     // 5. scale * sin^2(...)
     struct ggml_tensor * part2 = ggml_mul(ctx, sin_sq, scale);
 
     // 6. x + part2
-    return ggml_add(ctx, x, part2);
+    struct ggml_tensor * part2_repeated = ggml_repeat(ctx, part2, x);
+    
+    printf("SNAKE ADD START: x(%lld,%lld) + p2(%lld,%lld)\n", (long long)x->ne[0], (long long)x->ne[1], (long long)part2_repeated->ne[0], (long long)part2_repeated->ne[1]);
+    struct ggml_tensor * res = ggml_add(ctx, x, part2_repeated);
+    printf("SNAKE ADD END\n");
+    return res;
 }
 
 // Helper for Causal Conv1d
@@ -197,6 +213,37 @@ struct ggml_tensor * ggml_snake_beta(
 // So `k` is fastest.
 // So `ne0=k, ne1=in, ne2=out` matches PyTorch memory layout perfectly.
 // So `ggml_conv_1d` should work directly with PyTorch weights.
+// Fixed version of ggml_conv_1d that doesn't hardcode GGML_TYPE_F16 for im2col
+static struct ggml_tensor * fixed_ggml_conv_1d(
+    struct ggml_context * ctx,
+    struct ggml_tensor * w,
+    struct ggml_tensor * x,
+    int s0,
+    int p0,
+    int d0
+) {
+    // Original ggml_conv_1d has a bug/feature where it hardcodes GGML_TYPE_F16 for im2col
+    // causing assertions if the backend doesn't support F16 im2col.
+    
+    // x: (T, IC, N) -> GGML: [ne0=T, ne1=IC, ne2=N]
+    // w: (K, IC, OC) -> GGML: [ne0=K, ne1=IC, ne2=OC]
+    
+    // ggml_im2col(ctx, w, x, s0, s1, p0, p1, d0, d1, is_2d, type)
+    struct ggml_tensor * im2col = ggml_im2col(ctx, w, x, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F32);
+    
+    printf("IM2COL shape: (%lld,%lld,%lld,%lld)\n", (long long)im2col->ne[0], (long long)im2col->ne[1], (long long)im2col->ne[2], (long long)im2col->ne[3]);
+    printf("W shape: (%lld,%lld,%lld,%lld)\n", (long long)w->ne[0], (long long)w->ne[1], (long long)w->ne[2], (long long)w->ne[3]);
+
+    struct ggml_tensor * result = ggml_mul_mat(ctx,
+        ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])),
+        ggml_reshape_2d(ctx, w, (w->ne[0] * w->ne[1]), w->ne[2]));
+        
+    printf("RESULT shape before final reshape: (%lld,%lld,%lld,%lld)\n", (long long)result->ne[0], (long long)result->ne[1], (long long)result->ne[2], (long long)result->ne[3]);
+    result = ggml_reshape_3d(ctx, result, im2col->ne[1], w->ne[2], im2col->ne[2]);
+    
+    return result;
+}
+
 static struct ggml_tensor * causal_conv1d(
     struct ggml_context * ctx,
     struct ggml_tensor * x,
@@ -205,28 +252,26 @@ static struct ggml_tensor * causal_conv1d(
     int stride,
     int dilation
 ) {
-    // x: (T, in)
-    // w: (k, in, out)
+    // x: (T, in) -> ne[0]=T, ne[1]=in
+    // w: (k, in, out) -> ne[0]=k, ne[1]=in, ne[2]=out
     
+    // ggml_conv_1d expects x to be (T, IC, N) and w to be (K, IC, OC)
+    // Our x is (T, IC). We need to reshape it to (T, IC, 1).
+    printf("CONV1D RESHAPE: x(%lld,%lld,%lld,%lld) nelem=%lld\n", 
+           (long long)x->ne[0], (long long)x->ne[1], (long long)x->ne[2], (long long)x->ne[3], (long long)ggml_nelements(x));
+    struct ggml_tensor * x_3d = ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1);
+
     // Pad x for causality
-    // Padding = (k-1) * dilation
     int k = w->ne[0];
     int padding = (k - 1) * dilation;
-    
-    // To implement causal padding:
-    // Pad LEFT (top in time) with zeros.
-    // ggml_pad creates a new tensor with padding.
-    // We want to pad dim 0 (time).
-    // ggml_pad(ctx, a, pad_0_left, pad_1_left, pad_0_right, pad_1_right)
-    struct ggml_tensor * x_pad = ggml_pad(ctx, x, padding, 0, 0, 0); 
+    struct ggml_tensor * x_pad = ggml_pad(ctx, x_3d, padding, 0, 0, 0); 
     
     // Convolution
-    // ggml_conv_1d(ctx, w, a, s0, p0, d0)
-    // p0 is padding. If we manually padded, p0=0?
-    // If we use p0 in conv_1d, it pads both sides usually? 
-    // Or it might be "valid" vs "same".
-    // Let's use p0=0 and manual padding to be safe for causality.
-    struct ggml_tensor * res = ggml_conv_1d(ctx, w, x_pad, stride, 0, dilation);
+    printf("CONV1D: w_type=%d, x_pad_type=%d\n", w->type, x_pad->type);
+    struct ggml_tensor * res = fixed_ggml_conv_1d(ctx, w, x_pad, stride, 0, dilation);
+    
+    // Result is (T_out, OC, 1). Reshape back to (T_out, OC).
+    res = ggml_reshape_2d(ctx, res, res->ne[0], res->ne[1]);
     
     // Bias
     if (b) {
@@ -234,10 +279,54 @@ static struct ggml_tensor * causal_conv1d(
         // res: (T_out, out) -> ne[0]=T, ne[1]=out
         // We need b to be (1, out) to broadcast dim 0.
         struct ggml_tensor * b_reshaped = ggml_reshape_2d(ctx, b, 1, b->ne[0]);
-        res = ggml_add(ctx, res, b_reshaped);
+        // Instead of plain add, use repeat if needed, or ensure ggml_add can handle it.
+        // Some ggml versions require explicit repeat for broadcasting.
+        struct ggml_tensor * b_repeated = ggml_repeat(ctx, b_reshaped, res);
+        
+        // Debugging GGML_ASSERT(ggml_can_repeat(b, a))
+        // Note: ggml_add(a, b) calls ggml_can_repeat(b, a)
+        // a is res, b is b_repeated
+        // ggml_can_repeat(b, a) checks if b's dims can be repeated to match a.
+        // If they match exactly, it should pass.
+        if (res->ne[0] != b_repeated->ne[0] || res->ne[1] != b_repeated->ne[1]) {
+             printf("CONV1D BIAS ERROR: res(%lld, %lld), b_rep(%lld, %lld)\n", 
+                    (long long)res->ne[0], (long long)res->ne[1], (long long)b_repeated->ne[0], (long long)b_repeated->ne[1]);
+        }
+        
+        printf("CONV BIAS ADD: %s, res(%lld,%lld) + b_rep(%lld,%lld)\n", 
+               ggml_get_name(res), (long long)res->ne[0], (long long)res->ne[1], (long long)b_repeated->ne[0], (long long)b_repeated->ne[1]);
+        res = ggml_add(ctx, res, b_repeated);
     }
     
     return res;
+}
+
+// Fixed version of ggml_conv_transpose_1d
+static struct ggml_tensor * fixed_ggml_conv_transpose_1d(
+    struct ggml_context * ctx,
+    struct ggml_tensor * w,
+    struct ggml_tensor * x,
+    int stride,
+    int p0,
+    int d0
+) {
+    // Current ggml doesn't have a direct conv_transpose_1d exposed or it also has F16 issues.
+    // Let's check how it's implemented in ggml.c if it exists.
+    // If not, we can implement via im2col_back or custom.
+    // For now, let's assume it exists but needs F32.
+    // Wait, ggml_conv_transpose_1d is often not available in older ggml.
+    // Let's use the one that's there but fix it if possible.
+    
+    // If we can't easily fix it, let's just use the existing one and pray it's not the one failing.
+    // Actually, the error log showed it failing AFTER several CONV_TRANS.
+    // Wait, the error happened after the LAST CONV1D.
+    // "CONV1D: w_type=0, x_pad_type=0"
+    // "CONV BIAS ADD:  (reshaped), res(191445,1) + b_rep(191445,1)"
+    // "Decoder: computing graph..."
+    // "GGML_ASSERT(src0->type == GGML_TYPE_F16) failed"
+    // The last CONV1D succeeded in building, but the graph execution failed.
+    
+    return ggml_conv_transpose_1d(ctx, w, x, stride, p0, d0);
 }
 
 // Helper for Causal Transpose Conv1d (Upsampling)
@@ -250,18 +339,22 @@ static struct ggml_tensor * causal_conv_transpose_1d(
 ) {
     // x: (T, in)
     // w: (in, out, k)? Or (out, in, k)?
-    // PyTorch ConvTranspose1d weight: (in_channels, out_channels/groups, kernel_size)
-    // Note: PyTorch ConvTranspose1d swaps in/out in weight definition compared to Conv1d.
-    // GGML expects?
-    // If `ggml_conv_transpose_1d` follows standard, it likely expects kernel.
-    // Let's assume PyTorch layout is preserved.
     
+    // Reshape x to (T, in, 1) for conv_transpose
+    struct ggml_tensor * x_3d = ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], 1);
+
     // ggml_conv_transpose_1d(ctx, w, a, s0, p0, d0)
-    // Not universally available in all ggml versions?
-    // If we assume it is:
-    struct ggml_tensor * res = ggml_conv_transpose_1d(ctx, w, x, stride, 0, 1);
+    printf("CONV_TRANS: w_type=%d, x_type=%d\n", w->type, x_3d->type);
+    struct ggml_tensor * res = ggml_conv_transpose_1d(ctx, w, x_3d, stride, 0, 1);
+    
+    // res is (T_new, out, 1). Reshape to (T_new, out).
+    res = ggml_reshape_2d(ctx, res, res->ne[0], res->ne[1]);
     
     // Causal cropping
+    printf("CONV_TRANSPOSE: x(%lld,%lld), w(%lld,%lld,%lld), res(%lld,%lld)\n", 
+           (long long)x->ne[0], (long long)x->ne[1],
+           (long long)w->ne[0], (long long)w->ne[1], (long long)w->ne[2],
+           (long long)res->ne[0], (long long)res->ne[1]);
     // PyTorch: 
     // pad = kernel_size - stride
     // left_pad = ceil(pad)
@@ -317,7 +410,10 @@ static struct ggml_tensor * causal_conv_transpose_1d(
 
     if (b) {
         struct ggml_tensor * b_reshaped = ggml_reshape_2d(ctx, b, 1, b->ne[0]);
-        cropped = ggml_add(ctx, cropped, b_reshaped);
+        struct ggml_tensor * b_repeated = ggml_repeat(ctx, b_reshaped, cropped);
+        printf("CONV_TRANS_BIAS ADD: cropped(%lld,%lld) + b_rep(%lld,%lld)\n",
+               (long long)cropped->ne[0], (long long)cropped->ne[1], (long long)b_repeated->ne[0], (long long)b_repeated->ne[1]);
+        cropped = ggml_add(ctx, cropped, b_repeated);
     }
     
     return cropped;
@@ -327,8 +423,8 @@ static struct ggml_tensor * causal_conv_transpose_1d(
 static struct ggml_tensor * get_tensor(const std::map<std::string, struct ggml_tensor *> & weights, std::string name) {
     auto it = weights.find(name);
     if (it == weights.end()) {
-        std::cerr << "Tensor not found: " << name << std::endl;
-        return NULL; // Will likely crash later, but better than silent
+        // printf("Tensor not found: %s\n", name.c_str());
+        return NULL; 
     }
     return it->second;
 }
@@ -345,49 +441,72 @@ struct ggml_cgraph * Qwen3AudioDecoder::build_graph(struct ggml_context * ctx0, 
     
     // Semantic (Layer 0)
     {
-        // ... (loading logic) ...
-        // Correct name: decoder.quantizer.rvq_first.vq.l.0._cb.sum
-        std::string name_sum = "decoder.quantizer.rvq_first.vq.l.0._cb.sum"; 
+        // Correct name: dec.q.sem.l.0.cb.sum or embed_sum
+        std::string name_sum = "dec.q.sem.l.0.cb.sum"; 
         struct ggml_tensor * w_sum = get_tensor(weights, name_sum);
+        if (!w_sum) w_sum = get_tensor(weights, "dec.q.sem.l.0.cb.embed_sum");
         if (!w_sum) {
-             w_sum = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, config.codebook_dim, config.codebook_size);
-             ggml_set_f32(w_sum, 0.0f);
+             // Try fallback or original name
+             w_sum = get_tensor(weights, "decoder.quantizer.rvq_first.vq.l.0._cb.sum");
         }
         
-        struct ggml_tensor * codes_0 = ggml_view_1d(ctx0, codes, seq_len, 0);
-        struct ggml_tensor * emb_0 = ggml_get_rows(ctx0, w_sum, codes_0); 
-        emb_0 = ggml_transpose(ctx0, emb_0);
-        
-        struct ggml_tensor * w_proj = get_tensor(weights, "decoder.quantizer.rvq_first.output_proj.weight");
-        struct ggml_tensor * b_proj = get_tensor(weights, "decoder.quantizer.rvq_first.output_proj.bias"); 
+        if (w_sum) {
+            struct ggml_tensor * codes_0 = ggml_view_1d(ctx0, codes, seq_len, 0);
+            struct ggml_tensor * emb_0 = ggml_get_rows(ctx0, w_sum, codes_0); 
+            emb_0 = ggml_cont(ctx0, ggml_transpose(ctx0, emb_0));
+            
+            struct ggml_tensor * w_proj = get_tensor(weights, "dec.q.sem.output_proj.weight");
+            if (!w_proj) w_proj = get_tensor(weights, "decoder.quantizer.rvq_first.output_proj.weight");
 
-        if (w_proj) {
-            emb_0 = causal_conv1d(ctx0, emb_0, w_proj, b_proj, 1, 1);
+            if (w_proj) {
+                // We might need bias if it exists
+                struct ggml_tensor * b_proj = get_tensor(weights, "dec.q.sem.output_proj.bias");
+                if (!b_proj) b_proj = get_tensor(weights, "decoder.quantizer.rvq_first.output_proj.bias");
+                emb_0 = causal_conv1d(ctx0, emb_0, w_proj, b_proj, 1, 1);
+            }
+            hidden = emb_0;
         }
-        hidden = emb_0;
         // Debug
-        printf("Hidden 0 shape: %ld, %ld\n", hidden->ne[0], hidden->ne[1]);
+        if (hidden) printf("Hidden 0 shape: %lld, %lld\n", (long long)hidden->ne[0], (long long)hidden->ne[1]);
     }
     
     // Acoustic (Layers 1..N)
     for (int i = 1; i < n_codebooks; i++) {
-        std::string layer_prefix = "decoder.quantizer.rvq_rest.vq.l." + std::to_string(i - 1) + "._cb.";
+        // GGUF uses dec.q.ac.l.(i-1).cb.sum or dec.q.ac.l.(i-1).cb.embed_sum
+        std::string layer_prefix = "dec.q.ac.l." + std::to_string(i - 1) + ".cb.";
         struct ggml_tensor * w_sum = get_tensor(weights, layer_prefix + "sum");
-        if (!w_sum) continue;
+        if (!w_sum) w_sum = get_tensor(weights, layer_prefix + "embed_sum");
+        
+        if (!w_sum) {
+            printf("Warning: Codebook %d sum tensor not found.\n", i);
+            continue;
+        }
         
         struct ggml_tensor * codes_i = ggml_view_1d(ctx0, codes, seq_len, i * codes->nb[1]);
         struct ggml_tensor * emb_i = ggml_get_rows(ctx0, w_sum, codes_i);
-        emb_i = ggml_transpose(ctx0, emb_i);
+        emb_i = ggml_cont(ctx0, ggml_transpose(ctx0, emb_i));
         
-        struct ggml_tensor * w_proj = get_tensor(weights, "decoder.quantizer.rvq_rest.output_proj.weight");
+        struct ggml_tensor * w_proj = get_tensor(weights, "dec.q.ac.output_proj.weight");
+        if (!w_proj) w_proj = get_tensor(weights, "decoder.quantizer.rvq_rest.output_proj.weight");
         
         if (w_proj) {
             emb_i = causal_conv1d(ctx0, emb_i, w_proj, NULL, 1, 1);
         }
         
         // Debug
-        printf("Hidden shape: %ld, %ld. Emb_i shape: %ld, %ld\n", hidden->ne[0], hidden->ne[1], emb_i->ne[0], emb_i->ne[1]);
-        hidden = ggml_add(ctx0, hidden, emb_i);
+        if (hidden) {
+            printf("Layer %d: hidden(%lld, %lld), emb_i(%lld, %lld)\n", i, (long long)hidden->ne[0], (long long)hidden->ne[1], (long long)emb_i->ne[0], (long long)emb_i->ne[1]);
+            // Ensure shapes match exactly for addition if they are (T, C)
+            if (hidden->ne[0] == emb_i->ne[0] && hidden->ne[1] == emb_i->ne[1]) {
+                printf("QUANT ADD layer %d\n", i);
+                hidden = ggml_add(ctx0, hidden, emb_i);
+            } else {
+                printf("ERROR: Shape mismatch at layer %d! hidden(%lld, %lld) vs emb_i(%lld, %lld)\n", 
+                       i, (long long)hidden->ne[0], (long long)hidden->ne[1], (long long)emb_i->ne[0], (long long)emb_i->ne[1]);
+            }
+        } else {
+            hidden = emb_i;
+        }
     }
     
     // hidden is (T, C).

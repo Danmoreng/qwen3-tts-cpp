@@ -27,6 +27,7 @@ add_executable(qwen3-tts-cli
     main.cpp
     qwen3_audio_decoder.cpp
     qwen3_talker.cpp
+    qwen3_common.cpp
 )
 
 # Link against llama (high level) and ggml (low level for custom ops)
@@ -34,7 +35,10 @@ if (TARGET common)
     target_link_libraries(qwen3-tts-cli PRIVATE common)
 endif()
 
-target_link_libraries(qwen3-tts-cli PRIVATE llama ggml)
+target_link_libraries(qwen3-tts-cli PRIVATE llama ggml ggml-cpu ggml-base)
+if (GGML_CUDA)
+    target_link_libraries(qwen3-tts-cli PRIVATE ggml-cuda)
+endif()
 
 # Include paths
 target_include_directories(qwen3-tts-cli PRIVATE 

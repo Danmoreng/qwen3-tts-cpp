@@ -17,7 +17,7 @@ int main(int argc, char ** argv) {
     llama_backend_init();
     
     // 2. Load Models
-    std::string model_path = "qwen3_tts_full.gguf";
+    std::string model_path = "models/qwen3_tts_full.gguf";
 
     Qwen3TalkerConfig talker_cfg;
     Qwen3Talker talker(talker_cfg);
@@ -52,7 +52,7 @@ int main(int argc, char ** argv) {
 
     // Convert codes to ggml tensor for decoding
     struct ggml_init_params params = {
-        /*.mem_size   =*/ 1024*1024*128, // 128MB for graph nodes
+        /*.mem_size   =*/ 1024*1024*1024 * 2ULL, // 2GB for graph nodes
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ false,
     };
